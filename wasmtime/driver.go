@@ -1,12 +1,12 @@
 package wasmtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"time"
 
@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/consul-template/signals"
 	"github.com/hashicorp/go-hclog"
 	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/plugins/base"
@@ -25,8 +26,8 @@ import (
 const (
 	PluginName          = "wasmtime-driver"
 	PluginVersion       = "v0.0.1"
-	FingerprintInterval = 30 * time.Second
-	TaskHandleVersion   = 1
+	fingerprintInterval = 30 * time.Second
+	taskHandleVersion   = 1
 )
 
 var (
@@ -46,9 +47,18 @@ var (
 			hclspec.NewAttr("wasmtime_runtime", "string", false),
 			hclspec.NewLiteral("wasmtime"), // Default assumes it's on the path
 		),
-		"stats_interval": hclspec.NewAttr("stats_interval", "string", false),
-		"auth": hclspec.NewBlock("wasm_config", false, hclspec.NewObject(map[string]*hclspec.Spec{
+		"wasmtime_version": hclspec.NewAttr("wasmtime_version", "string", true),
+		"stats_interval": hclspec.NewDefault(
+			hclspec.NewAttr("stats_interval", "string", false),
+			hclspec.NewLiteral("30s"), // Default stats interval to 30s
+		),
+	})
 
+	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
+		"module_path": hclspec.NewAttr("module_path", "string", false),
+		"module_wat":  hclspec.NewAttr("module_wat", "string", false),
+		"call_func":   hclspec.NewAttr("call_func", "string", true),
+		"wasmtime_config": hclspec.NewBlock("wasmtime_config", false, hclspec.NewObject(map[string]*hclspec.Spec{
 			"debug_info": hclspec.NewDefault(
 				hclspec.NewAttr("debug_info", "bool", false),
 				hclspec.NewLiteral("false"),
@@ -85,37 +95,32 @@ var (
 				hclspec.NewAttr("consume_fuel", "bool", false),
 				hclspec.NewLiteral("false"),
 			),
-			// TODO: Configure embedded struct
-			"wasm_strategy": hclspec.NewDefault(
-				hclspec.NewAttr("wasm_strategy", "struct", false),
-				hclspec.NewLiteral("{}"),
+			"compiler": hclspec.NewDefault(
+				hclspec.NewAttr("compiler", "number", false),
+				hclspec.NewLiteral("1"),
+				// see this for enum values https://docs.wasmtime.dev/api/wasmtime/enum.Strategy.html
 			),
 			"cranelift_debug_verifier": hclspec.NewDefault(
 				hclspec.NewAttr("cranelift_debug_verifier", "bool", false),
 				hclspec.NewLiteral("false"),
 			),
-			// TODO: enum?
 			"cranelift_opt_level": hclspec.NewDefault(
-				hclspec.NewAttr("cranelift_opt_level", "enum", false),
-				hclspec.NewLiteral("1"),
+				hclspec.NewAttr("cranelift_opt_level", "number", false),
+				hclspec.NewLiteral("0"),
+				// see this link for enum values https://docs.wasmtime.dev/api/cranelift/prelude/settings/enum.OptLevel.html
 			),
 			"profiler": hclspec.NewDefault(
-				hclspec.NewAttr("profiler", "struct", false),
-				hclspec.NewLiteral("{}"),
+				hclspec.NewAttr("profiler", "number", false),
+				hclspec.NewLiteral("0"),
+				// see this link for enum values https://docs.wasmtime.dev/api/wasmtime/enum.ProfilingStrategy.html
 			),
 		})),
-	})
-
-	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"module_path": hclspec.NewAttr("module_path", "string", false),
-		"module_wat":  hclspec.NewAttr("module_wat", "string", false),
-		"call_func":   hclspec.NewAttr("call_func", "string", true),
 	})
 
 	capabilities = &drivers.Capabilities{
 		SendSignals: true,
 		Exec:        true,
-		FSIsolation: drivers.FSIsolationChroot,
+		FSIsolation: drivers.FSIsolationImage,
 		NetIsolationModes: []drivers.NetIsolationMode{
 			drivers.NetIsolationModeHost,
 			drivers.NetIsolationModeGroup,
@@ -130,12 +135,73 @@ var (
 type Config struct {
 	Enabled         bool   `codec:"enabled"`
 	WasmtimeRuntime string `codec:"wasmtime_runtime"`
+	WasmtimeVersion string `codec:"wasmtime_version"`
+	StatsInterval   string `codec:"stats_interval"`
 }
 
 type TaskConfig struct {
-	ModulePath string `codec:"module_path"`
-	ModuleWat  string `codec:"module_wat"`
-	CallFunc   string `codec:"call_func"`
+	ModulePath     string         `codec:"module_path"`
+	ModuleWat      string         `codec:"module_wat"`
+	CallFunc       string         `codec:"call_func"`
+	WasmtimeConfig WasmtimeConfig `codec:"wasmtime_config`
+}
+
+func (tcfg *TaskConfig) Validate(nomadTaskConfig *drivers.TaskConfig) error {
+	if tcfg.CallFunc == "" {
+		return fmt.Errorf("invalid driver config: call func must be set")
+	}
+
+	if tcfg.ModulePath != "" && tcfg.ModuleWat != "" {
+		return fmt.Errorf("invalid driver config: only module path or module wat can be set")
+	}
+
+	if tcfg.ModulePath == "" && tcfg.ModuleWat == "" {
+		return fmt.Errorf("invalid driver config: either module path or module wat must be set")
+	}
+
+	// TODO: Read up on host networking expectations in wasmtime
+	if tcfg.HostNetwork && nomadTaskConfig.NetworkIsolation != nil {
+		return fmt.Errorf("host_network and bridge network mode are mutually exclusive, and only one of them should be set")
+	}
+}
+
+// For full reference see https://docs.wasmtime.dev/api/wasmtime/struct.Config.html
+// Note that this struct reflects the values that are configurable via wasmtime-go
+// which does include the full set of possible config options at the time of this writing.
+type WasmtimeConfig struct {
+	DebugInfo              bool `codec:"debug_info"`
+	WasmThreads            bool `codec:"wasm_threads"`
+	WasmReferenceTypes     bool `codec:"wasm_reference_types"`
+	WasmSIMD               bool `codec:"wasm_simd"`
+	WasmBulkMemory         bool `codec:"wasm_bulk_memory"`
+	WasmMultiValue         bool `codec:"wasm_multi_value"`
+	WasmMultiMemory        bool `codec:"wasm_multi_memory"`
+	WasmMemory64           bool `codec:"wasm_memory_64"`
+	ConsumeFuel            bool `codec:"consume_fuel"`
+	CompilationStrategy    int8 `codec:"compiler_strategy"`
+	CraneliftDebugVerifier bool `codec:"cranelift_debug_verifier"`
+	CraneliftOptLevel      int8 `codec:"cranelift_opt_level"`
+	ProfilingStrategy      int8 `codec:"profiling_strategy":`
+}
+
+func (wcfg *WasmtimeConfig) toNative() *wasmtime.Config {
+	result := wasmtime.NewConfig()
+
+	result.SetDebugInfo(wcfg.DebugInfo)
+	result.SetWasmThreads(wcfg.WasmThreads)
+	result.SetWasmReferenceTypes(wcfg.WasmReferenceTypes)
+	result.SetWasmSIMD(wcfg.WasmSIMD)
+	result.SetWasmBulkMemory(wcfg.WasmBulkMemory)
+	result.SetWasmMultiValue(wcfg.WasmMultiValue)
+	result.SetWasmMultiMemory(wcfg.WasmMultiMemory)
+	result.SetWasmMemory64(wcfg.WasmMemory64)
+	result.SetConsumeFuel(wcfg.ConsumeFuel)
+	result.SetStrategy(wasmtime.Strategy(wcfg.CompilationStrategy))
+	result.SetCraneliftDebugVerifier(wcfg.CraneliftDebugVerifier)
+	result.SetCraneliftOptLevel(wasmtime.OptLevel(wcfg.CraneliftOptLevel))
+	result.SetProfiler(wasmtime.ProfilingStrategy(wcfg.ProfilingStrategy))
+
+	return result
 }
 
 type TaskState struct {
@@ -149,37 +215,56 @@ type TaskState struct {
 }
 
 type WasmtimeDriverPlugin struct {
+	// eventer is used to handle multiplexing of TaskEvents calls such that an
+	// event can be broadcast to all callers
 	eventer *eventer.Eventer
 
+	// config is the plugin configuration set by the SetConfig RPC
 	config *Config
 
+	// nomadConfig is the client config from Nomad
 	nomadConfig *base.ClientDriverConfig
 
+	// tasks is the in memory datastore mapping taskIDs to driver handles
 	tasks *taskStore
 
+	// ctx is the context for the driver. It is passed to other subsystems to
+	// coordinate shutdown
 	ctx context.Context
 
+	// ctxCancelFunc is called when the driver is shutting down and cancels
+	// the ctx passed to any subsystems
 	ctxCancelFunc context.CancelFunc
 
+	// logger will log to the Nomad agent
 	logger log.Logger
 
+	// context for wasmtime
 	ctxWasmtime context.Context
 
+	// wasmtime engine
+	// see this link for full documentation https://docs.wasmtime.dev/api/wasmtime/struct.Engine.html
+	engine *wasmtime.Engine
+
+	// wasmtime store
+	// see this link for full documentation https://docs.wasmtime.dev/api/wasmtime/struct.Store.html
 	store *wasmtime.Store
+
+	// duration to publish stats at
+	statsInterval time.Duration
 }
 
 func NewPlugin(logger log.Logger) drivers.DriverPlugin {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger = logger.Named(PluginName)
 
-	cfg := wasmtime.NewConfig()
-
-	store := wasmtime.NewStore(wasmtime.NewEngineWithConfig(cfg))
-
 	return &WasmtimeDriverPlugin{
-		eventer: eventer.NewEventer(ctx, logger),
-		logger:  logger,
-		ctx:     ctx,
+		eventer:       eventer.NewEventer(ctx, logger),
+		config:        &Config{},
+		tasks:         newTaskStore(),
+		logger:        logger,
+		ctx:           ctx,
+		ctxCancelFunc: cancel,
 	}
 }
 
@@ -205,29 +290,27 @@ func (d *WasmtimeDriverPlugin) SetConfig(cfg *base.Config) error {
 	// Save the configuration to the plugin
 	d.config = &config
 
-	// TODO: parse and validated any configuration value if necessary.
-	//
-	// If your driver agent configuration requires any complex validation
-	// (some dependency between attributes) or special data parsing (the
-	// string "10s" into a time.Interval) you can do it here and update the
-	// value in d.config.
-	//
-	// In the example below we check if the shell specified by the user is
-	// supported by the plugin.
-	shell := d.config.Shell
-	if shell != "bash" && shell != "fish" {
-		return fmt.Errorf("invalid shell %s", d.config.Shell)
+	// Validate plugin is enabled
+	if !d.config.Enabled {
+		return fmt.Errorf("%s not enabled on client", PluginName)
+	}
+
+	// Validate wasmtime is available
+	wasmtimePath, err := exec.LookPath(d.config.WasmtimeRuntime)
+	if err != nil {
+		return fmt.Errorf("wasmtime is not available on client at %s", wasmtimePath)
+	}
+	d.logger.Info("wasmtime is available on client at %s\n", wasmtimePath)
+
+	// Validate wasmtime version is set
+	if d.config.WasmtimeVersion == "" {
+		return errors.New("wastime_version is required")
 	}
 
 	// Save the Nomad agent configuration
 	if cfg.AgentConfig != nil {
 		d.nomadConfig = cfg.AgentConfig.Driver
 	}
-
-	// TODO: initialize any extra requirements if necessary.
-	//
-	// Here you can use the config values to initialize any resources that are
-	// shared by all tasks that use this driver, such as a daemon process.
 
 	return nil
 }
@@ -263,9 +346,8 @@ func (d *WasmtimeDriverPlugin) handleFingerprint(ctx context.Context, ch chan<- 
 		case <-d.ctx.Done():
 			return
 		case <-ticker.C:
-			// after the initial fingerprint we can set the proper fingerprint
-			// period
-			ticker.Reset(fingerprintPeriod)
+			// after the initial fingerprint we set the fingerprint interval
+			ticker.Reset(fingerprintInterval)
 			ch <- d.buildFingerprint()
 		}
 	}
@@ -279,7 +361,7 @@ func (d *WasmtimeDriverPlugin) buildFingerprint() *drivers.Fingerprint {
 		HealthDescription: drivers.DriverHealthy,
 	}
 
-	// TODO: implement fingerprinting logic to populate health and driver
+	// Implement fingerprinting logic to populate health and driver
 	// attributes.
 	//
 	// Fingerprinting is used by the plugin to relay two important information
@@ -292,50 +374,58 @@ func (d *WasmtimeDriverPlugin) buildFingerprint() *drivers.Fingerprint {
 	// the node in which the plugin is running (specific library availability,
 	// installed versions of a software etc.). These attributes can then be
 	// used by an operator to set job constrains.
-	//
-	// In the example below we check if the shell specified by the user exists
-	// in the node.
-	shell := d.config.Shell
 
-	cmd := exec.Command("which", shell)
+	// Fingerprint the wasmtime version
+	var outBuf, errBuf bytes.Buffer
+	cmd := exec.Command(d.config.WasmtimeRuntime, "--version")
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {
+		d.logger.Warn("failed to fingerprint wasmtime version: %v", err)
 		return &drivers.Fingerprint{
 			Health:            drivers.HealthStateUndetected,
-			HealthDescription: fmt.Sprintf("shell %s not found", shell),
+			HealthDescription: "wasmtime not found",
 		}
 	}
 
-	// We also set the shell and its version as attributes
-	cmd = exec.Command(shell, "--version")
-	if out, err := cmd.Output(); err != nil {
-		d.logger.Warn("failed to find shell version: %v", err)
-	} else {
-		re := regexp.MustCompile("[0-9]\\.[0-9]\\.[0-9]")
-		version := re.FindString(string(out))
-
-		fp.Attributes["driver.hello.shell_version"] = structs.NewStringAttribute(version)
-		fp.Attributes["driver.hello.shell"] = structs.NewStringAttribute(shell)
+	if errBuf.Len() != 0 {
+		d.logger.Warn("wasmtime version check returned error: %v", string(errBuf.Bytes()))
+		return &drivers.Fingerprint{
+			Health:            drivers.HealthStateUnhealthy,
+			HealthDescription: fmt.Sprintf("unable to fingerprint wasmtime version: %s", string(outBuf.Bytes())),
+		}
 	}
+
+	// We set the wasmtime version as attributes
+	re := regexp.MustCompile("[0-9]\\.[0-9]\\.[0-9]")
+	version := re.FindString(string(outBuf.Bytes()))
+
+	fp.Attributes["driver.wasmtime.version"] = structs.NewStringAttribute(version)
 
 	return fp
 }
 
 // StartTask returns a task handle and a driver network if necessary.
-func (d *WasmtimeDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
-	if _, ok := d.tasks.Get(cfg.ID); ok {
-		return nil, nil, fmt.Errorf("task with ID %q already started", cfg.ID)
+func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
+	if _, ok := d.tasks.Get(nomadTaskConfig.ID); ok {
+		return nil, nil, fmt.Errorf("task with ID %q already started", nomadTaskConfig.ID)
 	}
 
-	var driverConfig TaskConfig
-	if err := cfg.DecodeDriverConfig(&driverConfig); err != nil {
+	var taskConfig TaskConfig
+	if err := nomadTaskConfig.DecodeDriverConfig(&taskConfig); err != nil {
 		return nil, nil, fmt.Errorf("failed to decode driver config: %v", err)
 	}
 
-	d.logger.Info("starting task", "driver_cfg", hclog.Fmt("%+v", driverConfig))
-	handle := drivers.NewTaskHandle(taskHandleVersion)
-	handle.Config = cfg
+	err := taskConfig.Validate(nomadTaskConfig)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	// TODO: implement driver specific mechanism to start the task.
+	d.logger.Info("starting task", "driver_cfg", hclog.Fmt("%+v", taskConfig))
+	handle := drivers.NewTaskHandle(taskHandleVersion)
+	handle.Config = nomadTaskConfig
+
+	// Driver specific mechanism to start the task.
 	//
 	// Once the task is started you will need to store any relevant runtime
 	// information in a taskHandle and TaskState. The taskHandle will be
@@ -346,50 +436,60 @@ func (d *WasmtimeDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.Task
 	// drivers.TaskHandle instance. This TaskHandle will be sent back to plugin
 	// if the task ever needs to be recovered, so the TaskState should contain
 	// enough information to handle that.
-	//
-	// In the example below we use an executor to fork a process to run our
-	// greeter. The executor is then stored in the handle so we can access it
-	// later and the the plugin.Client is used to generate a reattach
-	// configuration that can be used to recover communication with the task.
-	executorConfig := &executor.ExecutorConfig{
-		LogFile:  filepath.Join(cfg.TaskDir().Dir, "executor.out"),
-		LogLevel: "debug",
-	}
 
-	exec, pluginClient, err := executor.CreateExecutor(d.logger, d.nomadConfig, executorConfig)
+	d.engine = wasmtime.NewEngineWithConfig(taskConfig.WasmtimeConfig.toNative())
+	d.buildStore(nomadTaskConfig)
+	d.ctxWasmtime = d.store.Context()
+
+	moduleConfig := newModuleConfig(nomadTaskConfig)
+
+	module, err := d.createModule(&taskConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create executor: %v", err)
+		return nil, nil, fmt.Errorf("error in creating module: %v", err)
 	}
 
-	echoCmd := fmt.Sprintf(`echo "%s"`, driverConfig.Greeting)
-	execCmd := &executor.ExecCommand{
-		Cmd:        d.config.Shell,
-		Args:       []string{"-c", echoCmd},
-		StdoutPath: cfg.StdoutPath,
-		StderrPath: cfg.StderrPath,
-	}
+	d.logger.Info(fmt.Sprintf("successfully created module with name: %s\n", moduleConfig.Name))
 
-	ps, err := exec.Launch(execCmd)
+	instance, err := wasmtime.NewInstance(d.store, module, []wasmtime.AsExtern{})
 	if err != nil {
-		pluginClient.Kill()
-		return nil, nil, fmt.Errorf("failed to launch command with executor: %v", err)
+		return nil, nil, fmt.Errorf("error in creating module instance: %v", err)
 	}
+
+	callFunc := instance.GetExport(d.store, moduleConfig.CallFunc).Func()
+	if callFunc == nil {
+		return nil, nil, fmt.Errorf("unable to export call func: %s", moduleConfig.CallFunc)
+	}
+
+	val, err := callFunc.Call(d.store)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error invoking call func: %s", moduleConfig.CallFunc)
+	}
+
+	task, err := d.createTask(container, nomadTaskConfig.StdoutPath, nomadTaskConfig.StderrPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error in creating task: %v", err)
+	}
+
+	d.logger.Info(fmt.Sprintf("successfully created task with ID: %s\n", task.ID()))
 
 	h := &taskHandle{
-		exec:         exec,
-		pid:          ps.Pid,
-		pluginClient: pluginClient,
-		taskConfig:   cfg,
-		procState:    drivers.TaskStateRunning,
-		startedAt:    time.Now().Round(time.Millisecond),
-		logger:       d.logger,
+		taskConfig:     nomadTaskConfig,
+		procState:      drivers.TaskStateRunning,
+		startedAt:      time.Now().Round(time.Millisecond),
+		logger:         d.logger,
+		totalCpuStats:  stats.NewCpuStats(),
+		userCpuStats:   stats.NewCpuStats(),
+		systemCpuStats: stats.NewCpuStats(),
+		module:         module,
+		moduleName:     moduleConfig.Name,
+		task:           task,
 	}
 
 	driverState := TaskState{
-		ReattachConfig: structs.ReattachConfigFromGoPlugin(pluginClient.ReattachConfig()),
-		Pid:            ps.Pid,
-		TaskConfig:     cfg,
-		StartedAt:      h.startedAt,
+		StartedAt:     h.startedAt,
+		ContainerName: containerName,
+		StdoutPath:    cfg.StdoutPath,
+		StderrPath:    cfg.StderrPath,
 	}
 
 	if err := handle.SetDriverState(&driverState); err != nil {
@@ -397,8 +497,40 @@ func (d *WasmtimeDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.Task
 	}
 
 	d.tasks.Set(cfg.ID, h)
-	go h.run()
+
+	go h.run(d.ctxContainerd)
 	return handle, nil, nil
+}
+
+func (d *WasmtimeDriverPlugin) buildStore(cfg *drivers.TaskConfig) {
+	store := wasmtime.NewStore(d.engine)
+
+	if len(cfg.Env) != 0 {
+		keys := []string{"WASMTIME"}
+		vals := []string{"GO"}
+		for key, val := range cfg.Env {
+			keys = append(keys, key)
+			vals = append(vals, val)
+		}
+		wasiConfig := wasmtime.NewWasiConfig()
+		wasiConfig.SetEnv(keys, vals)
+		store.SetWasi(wasiConfig)
+	}
+
+	d.store = store
+}
+
+func (d *WasmtimeDriverPlugin) createModule(taskConfig *TaskConfig) (*wasmtime.Module, error) {
+	if taskConfig.ModuleWat != "" {
+		wasm, err := wasmtime.Wat2Wasm(taskConfig.ModuleWat)
+		if err != nil {
+			return nil, fmt.Errorf("error converting wat to wasm: %v", err)
+		}
+
+		return wasmtime.NewModule(d.engine, wasm)
+	}
+
+	return wasmtime.NewModuleFromFile(d.engine, taskConfig.ModulePath)
 }
 
 // RecoverTask recreates the in-memory state of a task from a TaskHandle.
