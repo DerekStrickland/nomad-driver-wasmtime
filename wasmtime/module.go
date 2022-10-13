@@ -1,7 +1,7 @@
 package wasmtime
 
 import (
-	"github.com/hashicorp/client/taskenv"
+	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/plugins/drivers"
 )
 

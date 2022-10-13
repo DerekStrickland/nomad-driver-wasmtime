@@ -1,13 +1,14 @@
 job "example" {
   datacenters = ["dc1"]
-  type        = "batch"
+  type        = "service"
 
-  group "example" {
+  group "hello-world" {
     task "hello-world" {
-      driver = "hello-world-example"
+      driver = "nomad-driver-wasmtime"
 
       config {
-        greeting = "hello"
+        module_path = "/Users/derekstrickland/code/nomad-driver-wasmtime/example/hello-world/target/wasm32-wasi/debug/hello-world.wasm"
+        call_func   = "main"
       }
     }
   }

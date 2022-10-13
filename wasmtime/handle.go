@@ -2,6 +2,7 @@ package wasmtime
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -32,8 +33,11 @@ type taskHandle struct {
 	totalCpuStats  *stats.CpuStats
 	userCpuStats   *stats.CpuStats
 	systemCpuStats *stats.CpuStats
+	store          *wasmtime.Store
 	moduleName     string
 	module         *wasmtime.Module
+	instance       *wasmtime.Instance
+	callFunc       string
 	pid            int
 }
 
@@ -60,12 +64,26 @@ func (h *taskHandle) IsRunning() bool {
 	return h.procState == drivers.TaskStateRunning
 }
 
-func (h *taskHandle) run() {
+func (h *taskHandle) run(ctxWasmtime context.Context) {
 	h.stateLock.Lock()
 	if h.exitResult == nil {
 		h.exitResult = &drivers.ExitResult{}
 	}
 	h.stateLock.Unlock()
+
+	callFunc := h.instance.GetExport(h.store, h.callFunc).Func()
+	if callFunc == nil {
+		h.logger.Error(fmt.Sprintf("unable to export call func: %s", h.callFunc))
+		return
+	}
+
+	val, err := callFunc.Call(h.store)
+	if err != nil {
+		h.logger.Error(fmt.Sprintf("error invoking call func: %s", h.callFunc))
+		return
+	}
+
+	h.logger.Info("ran call func with result: %v", val)
 
 	// TODO: wait for your task to complete and upate its state.
 	ps, err := h.exec.Wait(context.Background())

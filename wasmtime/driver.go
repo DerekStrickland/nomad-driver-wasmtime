@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	PluginName          = "wasmtime-driver"
+	PluginName          = "nomad-driver-wasmtime"
 	PluginVersion       = "v0.0.1"
 	fingerprintInterval = 30 * time.Second
 	taskHandleVersion   = 1
@@ -43,17 +43,14 @@ var (
 			hclspec.NewAttr("enabled", "bool", false),
 			hclspec.NewLiteral("true"),
 		),
-		"wasmtime_runtime": hclspec.NewDefault(
-			hclspec.NewAttr("wasmtime_runtime", "string", false),
-			hclspec.NewLiteral("wasmtime"), // Default assumes it's on the path
-		),
+		"wasmtime_runtime": hclspec.NewAttr("wasmtime_runtime", "string", false),
 		"wasmtime_version": hclspec.NewAttr("wasmtime_version", "string", true),
-		"stats_interval": hclspec.NewDefault(
-			hclspec.NewAttr("stats_interval", "string", false),
-			hclspec.NewLiteral("30s"), // Default stats interval to 30s
-		),
+		"stats_interval":   hclspec.NewAttr("stats_interval", "string", false),
 	})
 
+	// see this link for enum values https://docs.wasmtime.dev/api/wasmtime/enum.Strategy.html
+	// see this link for enum values https://docs.wasmtime.dev/api/cranelift/prelude/settings/enum.OptLevel.html
+	// see this link for enum values https://docs.wasmtime.dev/api/wasmtime/enum.ProfilingStrategy.htmlß
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
 		"module_path": hclspec.NewAttr("module_path", "string", false),
 		"module_wat":  hclspec.NewAttr("module_wat", "string", false),
@@ -98,7 +95,6 @@ var (
 			"compiler": hclspec.NewDefault(
 				hclspec.NewAttr("compiler", "number", false),
 				hclspec.NewLiteral("1"),
-				// see this for enum values https://docs.wasmtime.dev/api/wasmtime/enum.Strategy.html
 			),
 			"cranelift_debug_verifier": hclspec.NewDefault(
 				hclspec.NewAttr("cranelift_debug_verifier", "bool", false),
@@ -107,12 +103,10 @@ var (
 			"cranelift_opt_level": hclspec.NewDefault(
 				hclspec.NewAttr("cranelift_opt_level", "number", false),
 				hclspec.NewLiteral("0"),
-				// see this link for enum values https://docs.wasmtime.dev/api/cranelift/prelude/settings/enum.OptLevel.html
 			),
 			"profiler": hclspec.NewDefault(
 				hclspec.NewAttr("profiler", "number", false),
 				hclspec.NewLiteral("0"),
-				// see this link for enum values https://docs.wasmtime.dev/api/wasmtime/enum.ProfilingStrategy.html
 			),
 		})),
 	})
@@ -136,7 +130,7 @@ type Config struct {
 	Enabled         bool   `codec:"enabled"`
 	WasmtimeRuntime string `codec:"wasmtime_runtime"`
 	WasmtimeVersion string `codec:"wasmtime_version"`
-	StatsInterval   string `codec:"stats_interval"`
+	StatsInterval   int    `codec:"stats_interval"`
 }
 
 type TaskConfig struct {
@@ -160,9 +154,11 @@ func (tcfg *TaskConfig) Validate(nomadTaskConfig *drivers.TaskConfig) error {
 	}
 
 	// TODO: Read up on host networking expectations in wasmtime
-	if tcfg.HostNetwork && nomadTaskConfig.NetworkIsolation != nil {
-		return fmt.Errorf("host_network and bridge network mode are mutually exclusive, and only one of them should be set")
-	}
+	// if tcfg.HostNetwork && nomadTaskConfig.NetworkIsolation != nil {
+	// 	return fmt.Errorf("host_network and bridge network mode are mutually exclusive, and only one of them should be set")
+	// }
+
+	return nil
 }
 
 // For full reference see https://docs.wasmtime.dev/api/wasmtime/struct.Config.html
@@ -439,7 +435,8 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 
 	d.engine = wasmtime.NewEngineWithConfig(taskConfig.WasmtimeConfig.toNative())
 	d.buildStore(nomadTaskConfig)
-	d.ctxWasmtime = d.store.Context()
+	// TODO: Figure out a cancellation context
+	// d.ctxWasmtime = d.store.Context()
 
 	moduleConfig := newModuleConfig(nomadTaskConfig)
 
@@ -455,22 +452,7 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 		return nil, nil, fmt.Errorf("error in creating module instance: %v", err)
 	}
 
-	callFunc := instance.GetExport(d.store, moduleConfig.CallFunc).Func()
-	if callFunc == nil {
-		return nil, nil, fmt.Errorf("unable to export call func: %s", moduleConfig.CallFunc)
-	}
-
-	val, err := callFunc.Call(d.store)
-	if err != nil {
-		return nil, nil, fmt.Errorf("error invoking call func: %s", moduleConfig.CallFunc)
-	}
-
-	task, err := d.createTask(container, nomadTaskConfig.StdoutPath, nomadTaskConfig.StderrPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("error in creating task: %v", err)
-	}
-
-	d.logger.Info(fmt.Sprintf("successfully created task with ID: %s\n", task.ID()))
+	d.logger.Info(fmt.Sprintf("successfully created task with ID: %s\n", instance.Exports(d.store)[3]))
 
 	h := &taskHandle{
 		taskConfig:     nomadTaskConfig,
@@ -480,25 +462,27 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 		totalCpuStats:  stats.NewCpuStats(),
 		userCpuStats:   stats.NewCpuStats(),
 		systemCpuStats: stats.NewCpuStats(),
+		store:          d.store,
 		module:         module,
 		moduleName:     moduleConfig.Name,
-		task:           task,
+		instance:       instance,
+		callFunc:       moduleConfig.CallFunc,
 	}
 
 	driverState := TaskState{
-		StartedAt:     h.startedAt,
-		ContainerName: containerName,
-		StdoutPath:    cfg.StdoutPath,
-		StderrPath:    cfg.StderrPath,
+		StartedAt:  h.startedAt,
+		ModuleName: h.moduleName,
+		StdoutPath: nomadTaskConfig.StdoutPath,
+		StderrPath: nomadTaskConfig.StderrPath,
 	}
 
 	if err := handle.SetDriverState(&driverState); err != nil {
 		return nil, nil, fmt.Errorf("failed to set driver state: %v", err)
 	}
 
-	d.tasks.Set(cfg.ID, h)
+	d.tasks.Set(nomadTaskConfig.ID, h)
 
-	go h.run(d.ctxContainerd)
+	go h.run(d.ctxWasmtime)
 	return handle, nil, nil
 }
 
@@ -525,6 +509,11 @@ func (d *WasmtimeDriverPlugin) createModule(taskConfig *TaskConfig) (*wasmtime.M
 		wasm, err := wasmtime.Wat2Wasm(taskConfig.ModuleWat)
 		if err != nil {
 			return nil, fmt.Errorf("error converting wat to wasm: %v", err)
+		}
+
+		err = wasmtime.ModuleValidate(d.engine, wasm)
+		if err != nil {
+			return nil, fmt.Errorf("error validating Wat2Wasm output: %v", err)
 		}
 
 		return wasmtime.NewModule(d.engine, wasm)
@@ -582,7 +571,7 @@ func (d *WasmtimeDriverPlugin) RecoverTask(handle *drivers.TaskHandle) error {
 
 	d.tasks.Set(taskState.TaskConfig.ID, h)
 
-	go h.run()
+	go h.run(d.ctxWasmtime)
 	return nil
 }
 
