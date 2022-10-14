@@ -1,9 +1,9 @@
-job "example" {
+job "wasmtime-hello-world" {
   datacenters = ["dc1"]
   type        = "service"
 
-  group "hello-world" {
-    task "hello-world" {
+  group "wasmtime-hello-world" {
+    task "wasmtime-hello-world" {
       driver = "nomad-driver-wasmtime"
 
       config {

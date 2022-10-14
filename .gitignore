@@ -1,2 +1,5 @@
 nomad-skeleton-driver-plugin
 nomad-driver-wasmtime
+
+example/hello-world/target/*
+*.log

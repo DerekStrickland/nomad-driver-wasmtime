@@ -130,7 +130,7 @@ type Config struct {
 	Enabled         bool   `codec:"enabled"`
 	WasmtimeRuntime string `codec:"wasmtime_runtime"`
 	WasmtimeVersion string `codec:"wasmtime_version"`
-	StatsInterval   int    `codec:"stats_interval"`
+	StatsInterval   string `codec:"stats_interval"`
 }
 
 type TaskConfig struct {
@@ -165,19 +165,19 @@ func (tcfg *TaskConfig) Validate(nomadTaskConfig *drivers.TaskConfig) error {
 // Note that this struct reflects the values that are configurable via wasmtime-go
 // which does include the full set of possible config options at the time of this writing.
 type WasmtimeConfig struct {
-	DebugInfo              bool `codec:"debug_info"`
-	WasmThreads            bool `codec:"wasm_threads"`
-	WasmReferenceTypes     bool `codec:"wasm_reference_types"`
-	WasmSIMD               bool `codec:"wasm_simd"`
-	WasmBulkMemory         bool `codec:"wasm_bulk_memory"`
-	WasmMultiValue         bool `codec:"wasm_multi_value"`
-	WasmMultiMemory        bool `codec:"wasm_multi_memory"`
-	WasmMemory64           bool `codec:"wasm_memory_64"`
-	ConsumeFuel            bool `codec:"consume_fuel"`
-	CompilationStrategy    int8 `codec:"compiler_strategy"`
-	CraneliftDebugVerifier bool `codec:"cranelift_debug_verifier"`
-	CraneliftOptLevel      int8 `codec:"cranelift_opt_level"`
-	ProfilingStrategy      int8 `codec:"profiling_strategy":`
+	DebugInfo              bool  `codec:"debug_info"`
+	WasmThreads            bool  `codec:"wasm_threads"`
+	WasmReferenceTypes     bool  `codec:"wasm_reference_types"`
+	WasmSIMD               bool  `codec:"wasm_simd"`
+	WasmBulkMemory         bool  `codec:"wasm_bulk_memory"`
+	WasmMultiValue         bool  `codec:"wasm_multi_value"`
+	WasmMultiMemory        bool  `codec:"wasm_multi_memory"`
+	WasmMemory64           bool  `codec:"wasm_memory_64"`
+	ConsumeFuel            bool  `codec:"consume_fuel"`
+	CompilationStrategy    uint8 `codec:"compiler_strategy"`
+	CraneliftDebugVerifier bool  `codec:"cranelift_debug_verifier"`
+	CraneliftOptLevel      uint8 `codec:"cranelift_opt_level"`
+	ProfilingStrategy      uint8 `codec:"profiling_strategy":`
 }
 
 func (wcfg *WasmtimeConfig) toNative() *wasmtime.Config {
@@ -296,7 +296,7 @@ func (d *WasmtimeDriverPlugin) SetConfig(cfg *base.Config) error {
 	if err != nil {
 		return fmt.Errorf("wasmtime is not available on client at %s", wasmtimePath)
 	}
-	d.logger.Info("wasmtime is available on client at %s\n", wasmtimePath)
+	d.logger.Info("wasmtime runtime available", "wasmtime_path", wasmtimePath)
 
 	// Validate wasmtime version is set
 	if d.config.WasmtimeVersion == "" {
@@ -397,6 +397,7 @@ func (d *WasmtimeDriverPlugin) buildFingerprint() *drivers.Fingerprint {
 	version := re.FindString(string(outBuf.Bytes()))
 
 	fp.Attributes["driver.wasmtime.version"] = structs.NewStringAttribute(version)
+	d.logger.Info("wasmtime runtime version", "wasmtime_runtime", version)
 
 	return fp
 }
