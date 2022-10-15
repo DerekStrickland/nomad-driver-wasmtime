@@ -34,10 +34,9 @@ type taskHandle struct {
 	userCpuStats   *stats.CpuStats
 	systemCpuStats *stats.CpuStats
 	store          *wasmtime.Store
-	moduleName     string
 	module         *wasmtime.Module
 	instance       *wasmtime.Instance
-	callFunc       string
+	moduleConfig   *ModuleConfig
 	pid            int
 }
 
@@ -71,19 +70,19 @@ func (h *taskHandle) run(ctxWasmtime context.Context) {
 	}
 	h.stateLock.Unlock()
 
-	callFunc := h.instance.GetExport(h.store, h.callFunc).Func()
+	callFunc := h.instance.GetFunc(h.store, h.moduleConfig.TaskConfig.CallFunc)
 	if callFunc == nil {
-		h.logger.Error(fmt.Sprintf("unable to export call func: %s", h.callFunc))
+		h.logger.Error(fmt.Sprintf("unable to export call func: %s", h.moduleConfig.TaskConfig.CallFunc))
 		return
 	}
 
-	val, err := callFunc.Call(h.store)
+	val, err := callFunc.Call(h.store, 6, 27)
 	if err != nil {
-		h.logger.Error(fmt.Sprintf("error invoking call func: %s", h.callFunc))
+		h.logger.Error(fmt.Sprintf("error invoking call func: %s", h.moduleConfig.TaskConfig.CallFunc))
 		return
 	}
 
-	h.logger.Info("ran call func with result: %v", val)
+	h.logger.Info("ran call func", "func_name", h.moduleConfig.TaskConfig.CallFunc, "result", val.(int32))
 
 	// TODO: wait for your task to complete and upate its state.
 	ps, err := h.exec.Wait(context.Background())

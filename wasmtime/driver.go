@@ -52,9 +52,10 @@ var (
 	// see this link for enum values https://docs.wasmtime.dev/api/cranelift/prelude/settings/enum.OptLevel.html
 	// see this link for enum values https://docs.wasmtime.dev/api/wasmtime/enum.ProfilingStrategy.htmlß
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"module_path": hclspec.NewAttr("module_path", "string", false),
-		"module_wat":  hclspec.NewAttr("module_wat", "string", false),
-		"call_func":   hclspec.NewAttr("call_func", "string", true),
+		"module_path":   hclspec.NewAttr("module_path", "string", false),
+		"module_wat":    hclspec.NewAttr("module_wat", "string", false),
+		"wat_file_path": hclspec.NewAttr("wat_file_path", "string", false),
+		"call_func":     hclspec.NewAttr("call_func", "string", true),
 		"wasmtime_config": hclspec.NewBlock("wasmtime_config", false, hclspec.NewObject(map[string]*hclspec.Spec{
 			"debug_info": hclspec.NewDefault(
 				hclspec.NewAttr("debug_info", "bool", false),
@@ -136,21 +137,22 @@ type Config struct {
 type TaskConfig struct {
 	ModulePath     string         `codec:"module_path"`
 	ModuleWat      string         `codec:"module_wat"`
+	WatFilePath    string         `codec:"wat_file_path"`
 	CallFunc       string         `codec:"call_func"`
 	WasmtimeConfig WasmtimeConfig `codec:"wasmtime_config`
 }
 
 func (tcfg *TaskConfig) Validate(nomadTaskConfig *drivers.TaskConfig) error {
 	if tcfg.CallFunc == "" {
-		return fmt.Errorf("invalid driver config: call func must be set")
+		return fmt.Errorf("invalid task config: call func must be set")
 	}
 
 	if tcfg.ModulePath != "" && tcfg.ModuleWat != "" {
-		return fmt.Errorf("invalid driver config: only module path or module wat can be set")
+		return fmt.Errorf("invalid task config: only module path or module wat can be set")
 	}
 
-	if tcfg.ModulePath == "" && tcfg.ModuleWat == "" {
-		return fmt.Errorf("invalid driver config: either module path or module wat must be set")
+	if tcfg.ModulePath == "" && tcfg.ModuleWat == "" && tcfg.WatFilePath == "" {
+		return fmt.Errorf("invalid task config: either module path or module wat or wat file path must be set")
 	}
 
 	// TODO: Read up on host networking expectations in wasmtime
@@ -439,21 +441,21 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 	// TODO: Figure out a cancellation context
 	// d.ctxWasmtime = d.store.Context()
 
-	moduleConfig := newModuleConfig(nomadTaskConfig)
+	moduleConfig := newModuleConfig(nomadTaskConfig, &taskConfig)
 
 	module, err := d.createModule(&taskConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error in creating module: %v", err)
+		return nil, nil, fmt.Errorf("error creating module: %v", err)
 	}
 
 	d.logger.Info(fmt.Sprintf("successfully created module with name: %s\n", moduleConfig.Name))
 
 	instance, err := wasmtime.NewInstance(d.store, module, []wasmtime.AsExtern{})
 	if err != nil {
-		return nil, nil, fmt.Errorf("error in creating module instance: %v", err)
+		return nil, nil, fmt.Errorf("error creating module instance: %v", err)
 	}
 
-	d.logger.Info(fmt.Sprintf("successfully created task with ID: %s\n", instance.Exports(d.store)[3]))
+	d.logger.Info(fmt.Sprintf("successfully created task with ID: %v\n", instance.Exports(d.store)[0]))
 
 	h := &taskHandle{
 		taskConfig:     nomadTaskConfig,
@@ -465,14 +467,13 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 		systemCpuStats: stats.NewCpuStats(),
 		store:          d.store,
 		module:         module,
-		moduleName:     moduleConfig.Name,
 		instance:       instance,
-		callFunc:       moduleConfig.CallFunc,
+		moduleConfig:   moduleConfig,
 	}
 
 	driverState := TaskState{
 		StartedAt:  h.startedAt,
-		ModuleName: h.moduleName,
+		ModuleName: h.moduleConfig.Name,
 		StdoutPath: nomadTaskConfig.StdoutPath,
 		StderrPath: nomadTaskConfig.StderrPath,
 	}
@@ -506,6 +507,21 @@ func (d *WasmtimeDriverPlugin) buildStore(cfg *drivers.TaskConfig) {
 }
 
 func (d *WasmtimeDriverPlugin) createModule(taskConfig *TaskConfig) (*wasmtime.Module, error) {
+	if taskConfig.WatFilePath != "" {
+		watBytes, err := os.ReadFile(taskConfig.WatFilePath)
+		wasm, err := wasmtime.Wat2Wasm(string(watBytes))
+		if err != nil {
+			return nil, fmt.Errorf("error converting wat file to wasm: %v", err)
+		}
+
+		err = wasmtime.ModuleValidate(d.engine, wasm)
+		if err != nil {
+			return nil, fmt.Errorf("error validating wat file Wat2Wasm output: %v", err)
+		}
+
+		return wasmtime.NewModule(d.engine, wasm)
+	}
+
 	if taskConfig.ModuleWat != "" {
 		wasm, err := wasmtime.Wat2Wasm(taskConfig.ModuleWat)
 		if err != nil {
