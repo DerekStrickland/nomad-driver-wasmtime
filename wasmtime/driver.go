@@ -52,10 +52,21 @@ var (
 	// see this link for enum values https://docs.wasmtime.dev/api/cranelift/prelude/settings/enum.OptLevel.html
 	// see this link for enum values https://docs.wasmtime.dev/api/wasmtime/enum.ProfilingStrategy.htmlß
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
+		"inherit_stdout": hclspec.NewDefault(
+			hclspec.NewAttr("inherit_stdout", "bool", false),
+			hclspec.NewLiteral("false"),
+		),
+		"inherit_stderr": hclspec.NewDefault(
+			hclspec.NewAttr("inherit_stderr", "bool", false),
+			hclspec.NewLiteral("false"),
+		),
 		"module_path":   hclspec.NewAttr("module_path", "string", false),
 		"module_wat":    hclspec.NewAttr("module_wat", "string", false),
 		"wat_file_path": hclspec.NewAttr("wat_file_path", "string", false),
 		"call_func":     hclspec.NewAttr("call_func", "string", true),
+		"call_args":     hclspec.NewAttr("call_args", "list(string)", false),
+		"init_func":     hclspec.NewAttr("init_func", "string", false),
+		"init_args":     hclspec.NewAttr("init_args", "list(string)", false),
 		"wasmtime_config": hclspec.NewBlock("wasmtime_config", false, hclspec.NewObject(map[string]*hclspec.Spec{
 			"debug_info": hclspec.NewDefault(
 				hclspec.NewAttr("debug_info", "bool", false),
@@ -135,11 +146,18 @@ type Config struct {
 }
 
 type TaskConfig struct {
+	// These first 2 are useful for debugging as you can see the module output in the agent logs
+	// rather than having to check the alloc dir.
+	InheritStdOut  bool           `codec:"inherit_stdout"`
+	InheritStdErr  bool           `codec:"inherit_stderr"`
 	ModulePath     string         `codec:"module_path"`
 	ModuleWat      string         `codec:"module_wat"`
 	WatFilePath    string         `codec:"wat_file_path"`
 	CallFunc       string         `codec:"call_func"`
-	WasmtimeConfig WasmtimeConfig `codec:"wasmtime_config`
+	CallArgs       []string       `codec:"call_args"`
+	InitFunc       string         `codec:"init_func"`
+	InitArgs       []string       `codec:"init_args"`
+	WasmtimeConfig WasmtimeConfig `codec:"wasmtime_config"`
 }
 
 func (tcfg *TaskConfig) Validate(nomadTaskConfig *drivers.TaskConfig) error {
@@ -179,7 +197,7 @@ type WasmtimeConfig struct {
 	CompilationStrategy    uint8 `codec:"compiler_strategy"`
 	CraneliftDebugVerifier bool  `codec:"cranelift_debug_verifier"`
 	CraneliftOptLevel      uint8 `codec:"cranelift_opt_level"`
-	ProfilingStrategy      uint8 `codec:"profiling_strategy":`
+	ProfilingStrategy      uint8 `codec:"profiling_strategy"`
 }
 
 func (wcfg *WasmtimeConfig) toNative() *wasmtime.Config {
@@ -239,14 +257,6 @@ type WasmtimeDriverPlugin struct {
 
 	// context for wasmtime
 	ctxWasmtime context.Context
-
-	// wasmtime engine
-	// see this link for full documentation https://docs.wasmtime.dev/api/wasmtime/struct.Engine.html
-	engine *wasmtime.Engine
-
-	// wasmtime store
-	// see this link for full documentation https://docs.wasmtime.dev/api/wasmtime/struct.Store.html
-	store *wasmtime.Store
 
 	// duration to publish stats at
 	statsInterval time.Duration
@@ -424,38 +434,11 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 	handle := drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = nomadTaskConfig
 
-	// Driver specific mechanism to start the task.
-	//
-	// Once the task is started you will need to store any relevant runtime
-	// information in a taskHandle and TaskState. The taskHandle will be
-	// stored in-memory in the plugin and will be used to interact with the
-	// task.
-	//
-	// The TaskState will be returned to the Nomad client inside a
-	// drivers.TaskHandle instance. This TaskHandle will be sent back to plugin
-	// if the task ever needs to be recovered, so the TaskState should contain
-	// enough information to handle that.
-
-	d.engine = wasmtime.NewEngineWithConfig(taskConfig.WasmtimeConfig.toNative())
-	d.buildStore(nomadTaskConfig)
-	// TODO: Figure out a cancellation context
-	// d.ctxWasmtime = d.store.Context()
-
-	moduleConfig := newModuleConfig(nomadTaskConfig, &taskConfig)
-
-	module, err := d.createModule(&taskConfig)
+	runtimeConfig := NewRuntimeConfig(nomadTaskConfig, &taskConfig)
+	runtime, err := NewRuntime(runtimeConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error creating module: %v", err)
+		return nil, nil, fmt.Errorf("error creating runtime: %v", err)
 	}
-
-	d.logger.Info(fmt.Sprintf("successfully created module with name: %s\n", moduleConfig.Name))
-
-	instance, err := wasmtime.NewInstance(d.store, module, []wasmtime.AsExtern{})
-	if err != nil {
-		return nil, nil, fmt.Errorf("error creating module instance: %v", err)
-	}
-
-	d.logger.Info(fmt.Sprintf("successfully created task with ID: %v\n", instance.Exports(d.store)[0]))
 
 	h := &taskHandle{
 		taskConfig:     nomadTaskConfig,
@@ -465,15 +448,13 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 		totalCpuStats:  stats.NewCpuStats(),
 		userCpuStats:   stats.NewCpuStats(),
 		systemCpuStats: stats.NewCpuStats(),
-		store:          d.store,
-		module:         module,
-		instance:       instance,
-		moduleConfig:   moduleConfig,
+		runtimeConfig:  runtimeConfig,
+		runtime:        runtime,
 	}
 
 	driverState := TaskState{
 		StartedAt:  h.startedAt,
-		ModuleName: h.moduleConfig.Name,
+		ModuleName: h.runtimeConfig.Name(),
 		StdoutPath: nomadTaskConfig.StdoutPath,
 		StderrPath: nomadTaskConfig.StderrPath,
 	}
@@ -486,57 +467,6 @@ func (d *WasmtimeDriverPlugin) StartTask(nomadTaskConfig *drivers.TaskConfig) (*
 
 	go h.run(d.ctxWasmtime)
 	return handle, nil, nil
-}
-
-func (d *WasmtimeDriverPlugin) buildStore(cfg *drivers.TaskConfig) {
-	store := wasmtime.NewStore(d.engine)
-
-	if len(cfg.Env) != 0 {
-		keys := []string{"WASMTIME"}
-		vals := []string{"GO"}
-		for key, val := range cfg.Env {
-			keys = append(keys, key)
-			vals = append(vals, val)
-		}
-		wasiConfig := wasmtime.NewWasiConfig()
-		wasiConfig.SetEnv(keys, vals)
-		store.SetWasi(wasiConfig)
-	}
-
-	d.store = store
-}
-
-func (d *WasmtimeDriverPlugin) createModule(taskConfig *TaskConfig) (*wasmtime.Module, error) {
-	if taskConfig.WatFilePath != "" {
-		watBytes, err := os.ReadFile(taskConfig.WatFilePath)
-		wasm, err := wasmtime.Wat2Wasm(string(watBytes))
-		if err != nil {
-			return nil, fmt.Errorf("error converting wat file to wasm: %v", err)
-		}
-
-		err = wasmtime.ModuleValidate(d.engine, wasm)
-		if err != nil {
-			return nil, fmt.Errorf("error validating wat file Wat2Wasm output: %v", err)
-		}
-
-		return wasmtime.NewModule(d.engine, wasm)
-	}
-
-	if taskConfig.ModuleWat != "" {
-		wasm, err := wasmtime.Wat2Wasm(taskConfig.ModuleWat)
-		if err != nil {
-			return nil, fmt.Errorf("error converting wat to wasm: %v", err)
-		}
-
-		err = wasmtime.ModuleValidate(d.engine, wasm)
-		if err != nil {
-			return nil, fmt.Errorf("error validating Wat2Wasm output: %v", err)
-		}
-
-		return wasmtime.NewModule(d.engine, wasm)
-	}
-
-	return wasmtime.NewModuleFromFile(d.engine, taskConfig.ModulePath)
 }
 
 // RecoverTask recreates the in-memory state of a task from a TaskHandle.

@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bytecodealliance/wasmtime-go"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/client/stats"
@@ -33,11 +32,9 @@ type taskHandle struct {
 	totalCpuStats  *stats.CpuStats
 	userCpuStats   *stats.CpuStats
 	systemCpuStats *stats.CpuStats
-	store          *wasmtime.Store
-	module         *wasmtime.Module
-	instance       *wasmtime.Instance
-	moduleConfig   *ModuleConfig
+	runtimeConfig  *RuntimeConfig
 	pid            int
+	runtime        *Runtime
 }
 
 func (h *taskHandle) TaskStatus() *drivers.TaskStatus {
@@ -70,19 +67,19 @@ func (h *taskHandle) run(ctxWasmtime context.Context) {
 	}
 	h.stateLock.Unlock()
 
-	callFunc := h.instance.GetFunc(h.store, h.moduleConfig.TaskConfig.CallFunc)
+	callFunc := h.runtime.instance.GetFunc(h.runtime.store, h.runtimeConfig.TaskConfig.CallFunc)
 	if callFunc == nil {
-		h.logger.Error(fmt.Sprintf("unable to export call func: %s", h.moduleConfig.TaskConfig.CallFunc))
+		h.logger.Error(fmt.Sprintf("unable to export call func: %s", h.runtimeConfig.TaskConfig.CallFunc))
 		return
 	}
 
-	val, err := callFunc.Call(h.store, 6, 27)
+	val, err := callFunc.Call(h.runtime.store, 0, 1)
 	if err != nil {
-		h.logger.Error(fmt.Sprintf("error invoking call func: %s", h.moduleConfig.TaskConfig.CallFunc))
+		h.logger.Error(fmt.Sprintf("error invoking call func: %s", h.runtimeConfig.TaskConfig.CallFunc), "error", err)
 		return
 	}
 
-	h.logger.Info("ran call func", "func_name", h.moduleConfig.TaskConfig.CallFunc, "result", val.(int32))
+	h.logger.Info("ran call func", "func_name", h.runtimeConfig.TaskConfig.CallFunc, "result", val)
 
 	// TODO: wait for your task to complete and upate its state.
 	ps, err := h.exec.Wait(context.Background())
@@ -95,6 +92,7 @@ func (h *taskHandle) run(ctxWasmtime context.Context) {
 		h.completedAt = time.Now()
 		return
 	}
+
 	h.procState = drivers.TaskStateExited
 	h.exitResult.ExitCode = ps.ExitCode
 	h.exitResult.Signal = ps.Signal
