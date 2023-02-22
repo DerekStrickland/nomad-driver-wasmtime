@@ -4,8 +4,8 @@ module github.com/hashicorp/nomad-skeleton-driver-plugin
 go 1.18
 
 require (
-	github.com/hashicorp/consul-template v0.29.1
-	github.com/hashicorp/go-hclog v1.2.1
+	github.com/hashicorp/consul-template v0.29.2
+	github.com/hashicorp/go-hclog v1.2.2
 	github.com/hashicorp/go-plugin v1.4.4
 	github.com/hashicorp/nomad v1.3.1
 )
@@ -31,7 +31,7 @@ require (
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.3.0 // indirect
-	github.com/hashicorp/consul/api v1.13.0 // indirect
+	github.com/hashicorp/consul/api v1.14.0 // indirect
 	github.com/hashicorp/cronexpr v1.1.1 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
